@@ -16,7 +16,8 @@
     textarea{min-height:90px;resize:vertical} button{border:0;border-radius:10px;padding:10px 12px;font-weight:700;cursor:pointer;background:var(--acc)}
     .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.sec{background:#1f2a3b;color:#cfe3ff}.ok{background:var(--ok)}
     .pill{padding:7px 10px;border:1px solid var(--line);border-radius:999px;font-size:.85rem}.hint{color:var(--mut);font-size:.88rem}
-    #status.bad{color:var(--bad)} #status.good{color:var(--ok)} video{display:none}
+    #status.bad{color:var(--bad)} #status.good{color:var(--ok)}
+    video{max-width:100%;border-radius:12px;background:#000;display:block;margin-bottom:8px}
     canvas{max-width:100%;border-radius:12px;background:#000}
   </style>
   <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
@@ -37,6 +38,7 @@
     <video id="video" autoplay playsinline muted></video>
     <canvas id="preview" width="640" height="360"></canvas>
     <div class="row" style="margin-top:8px">
+      <button id="btnCam" class="sec">📷 Activar cámara</button>
       <button id="btnNv">▶️ Iniciar simulación</button>
       <span id="status" class="pill">Reposo</span>
     </div>
@@ -91,7 +93,7 @@
   const video=$('video'), preview=$('preview'), pctx=preview.getContext('2d');
   const status=$('status'), nvResult=$('nvResult'), nonVerbalSummary=$('nonVerbalSummary');
   const transcript=$('transcript'), recState=$('recState'), origAudio=$('origAudio');
-  const btnNv=$('btnNv');
+  const btnNv=$('btnNv'), btnCam=$('btnCam');
 
   if (!window.isSecureContext) {
     $('secureWarn').textContent='⚠️ Contexto no seguro: cámara/micrófono suelen bloquearse en HTTP. Usa GitHub Pages (HTTPS).';
@@ -100,6 +102,9 @@
   }
 
   let mediaRecorder, recStream, webmBlob, recognition;
+  let keepRecognitionAlive = false;
+  let recognizing = false;
+  let restartTimer = null;
   let nvRunning=false, nvTimer=null, handsInstance=null, lastHands=0, startTs=0;
   const snapshots=[];
 
@@ -108,7 +113,17 @@
   async function ensureCamera(){
     if (video.srcObject) return true;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+      let stream = null;
+      try {
+        // Primer intento: cámara frontal + resolución moderada
+        stream = await navigator.mediaDevices.getUserMedia({
+          video:{facingMode:'user', width:{ideal:1280}, height:{ideal:720}},
+          audio:false
+        });
+      } catch (_) {
+        // Fallback amplio
+        stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+      }
       video.srcObject = stream; await video.play();
       setStatus('Cámara activa','good'); return true;
     } catch(e){
@@ -123,13 +138,25 @@
     handsInstance = new Hands({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${f}`});
     handsInstance.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.5,minTrackingConfidence:.5});
     handsInstance.onResults((res)=>{
-      pctx.clearRect(0,0,preview.width,preview.height);
-      pctx.drawImage(video,0,0,preview.width,preview.height);
-      const hands=res.multiHandLandmarks||[]; lastHands=hands.length;
-      hands.forEach(hand=>hand.forEach(pt=>{pctx.beginPath();pctx.arc(pt.x*preview.width,pt.y*preview.height,3,0,7);pctx.fillStyle='#22c55e';pctx.fill();}));
+      try {
+        if (!video.srcObject || video.readyState < 2) return;
+        pctx.clearRect(0,0,preview.width,preview.height);
+        pctx.drawImage(video,0,0,preview.width,preview.height);
+        const hands=res.multiHandLandmarks||[]; lastHands=hands.length;
+        hands.forEach(hand=>hand.forEach(pt=>{pctx.beginPath();pctx.arc(pt.x*preview.width,pt.y*preview.height,3,0,7);pctx.fillStyle='#22c55e';pctx.fill();}));
+      } catch (err) {
+        console.warn('Error dibujando frame de manos:', err);
+      }
     });
-    (function loop(){ if(video.readyState>=2) handsInstance.send({image:video}).catch(()=>{}); requestAnimationFrame(loop); })();
+    (function loop(){
+      if(video.srcObject && video.readyState>=2) {
+        handsInstance.send({image:video}).catch(()=>{});
+      }
+      requestAnimationFrame(loop);
+    })();
   }
+
+  btnCam.onclick = async () => { await ensureCamera(); };
 
   btnNv.onclick = async ()=>{
     if (!nvRunning){
@@ -154,7 +181,27 @@
   if (SR){
     recognition=new SR(); recognition.lang='es-ES'; recognition.continuous=true; recognition.interimResults=true;
     let acc=''; recognition.onresult=(e)=>{let interim=''; for(let i=e.resultIndex;i<e.results.length;i++){ if(e.results[i].isFinal) acc+=e.results[i][0].transcript+' '; else interim+=e.results[i][0].transcript;} transcript.value=(acc+interim).trim();};
-    recognition.onstart=()=>recState.textContent='grabando…'; recognition.onend=()=>recState.textContent='en reposo';
+    recognition.onstart=()=>{ recognizing = true; recState.textContent='grabando…'; };
+    recognition.onend=()=>{
+      recognizing = false;
+      if (keepRecognitionAlive) {
+        // Web Speech se corta en silencios; lo relanzamos
+        restartTimer = setTimeout(() => {
+          if (keepRecognitionAlive && !recognizing) {
+            try { recognition.start(); } catch(_) {}
+          }
+        }, 250);
+        recState.textContent='escuchando (reiniciando por silencio)…';
+      } else {
+        recState.textContent='en reposo';
+      }
+    };
+    recognition.onerror=()=>{
+      recognizing = false;
+      if (keepRecognitionAlive && !recognizing) {
+        setTimeout(() => { try { recognition.start(); } catch(_) {} }, 500);
+      }
+    };
   }
 
   $('startRec').onclick = async ()=>{
@@ -163,10 +210,20 @@
       mediaRecorder=new MediaRecorder(recStream); const chunks=[];
       mediaRecorder.ondataavailable=(e)=>chunks.push(e.data);
       mediaRecorder.onstop=async()=>{ webmBlob=new Blob(chunks,{type:'audio/webm'}); const mp3=await convertWebmToMp3(webmBlob); origAudio.src=URL.createObjectURL(mp3); origAudio.style.display='block'; };
-      mediaRecorder.start(); recognition&&recognition.start(); $('startRec').disabled=true; $('stopRec').disabled=false;
+      mediaRecorder.start();
+      keepRecognitionAlive = true;
+      if (recognition) { try { recognition.start(); } catch(_) {} }
+      $('startRec').disabled=true; $('stopRec').disabled=false;
     }catch(e){ alert('Micrófono no disponible: '+e.message); }
   };
-  $('stopRec').onclick = ()=>{ recognition&&recognition.stop(); mediaRecorder&&mediaRecorder.stop(); recStream&&recStream.getTracks().forEach(t=>t.stop()); $('startRec').disabled=false; $('stopRec').disabled=true; };
+  $('stopRec').onclick = ()=>{
+    keepRecognitionAlive = false;
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    recognition&&recognition.stop();
+    mediaRecorder&&mediaRecorder.stop();
+    recStream&&recStream.getTracks().forEach(t=>t.stop());
+    $('startRec').disabled=false; $('stopRec').disabled=true;
+  };
 
   async function convertWebmToMp3(blob){
     const arr=await blob.arrayBuffer(); const ctx=new (window.AudioContext||window.webkitAudioContext)(); const ab=await ctx.decodeAudioData(arr);
@@ -222,8 +279,11 @@
   };
 
   initHands();
+  window.addEventListener('error', (e) => {
+    setStatus('Error en ejecución: revisa consola del navegador', 'bad');
+    console.error('Error global:', e.error || e.message);
+  });
 })();
 </script>
 </body>
 </html>
-
