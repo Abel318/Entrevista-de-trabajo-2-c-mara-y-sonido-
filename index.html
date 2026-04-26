@@ -39,6 +39,7 @@
     <canvas id="preview" width="640" height="360"></canvas>
     <div class="row" style="margin-top:8px">
       <button id="btnCam" class="sec">📷 Activar cámara</button>
+      <button id="btnCamOff" class="sec" disabled>🛑 Apagar cámara</button>
       <button id="btnNv">▶️ Iniciar simulación</button>
       <span id="status" class="pill">Reposo</span>
     </div>
@@ -93,7 +94,7 @@
   const video=$('video'), preview=$('preview'), pctx=preview.getContext('2d');
   const status=$('status'), nvResult=$('nvResult'), nonVerbalSummary=$('nonVerbalSummary');
   const transcript=$('transcript'), recState=$('recState'), origAudio=$('origAudio');
-  const btnNv=$('btnNv'), btnCam=$('btnCam');
+  const btnNv=$('btnNv'), btnCam=$('btnCam'), btnCamOff=$('btnCamOff');
 
   if (!window.isSecureContext) {
     $('secureWarn').textContent='⚠️ Contexto no seguro: cámara/micrófono suelen bloquearse en HTTP. Usa GitHub Pages (HTTPS).';
@@ -102,6 +103,7 @@
   }
 
   let mediaRecorder, recStream, webmBlob, recognition;
+  let camStream = null;
   let keepRecognitionAlive = false;
   let recognizing = false;
   let restartTimer = null;
@@ -109,9 +111,19 @@
   const snapshots=[];
 
   function setStatus(msg, cls=''){ status.className='pill '+cls; status.textContent=msg; }
+  function stopTracks(stream) {
+    if (!stream) return;
+    stream.getTracks().forEach(t => t.stop());
+  }
 
   async function ensureCamera(){
-    if (video.srcObject) return true;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Este navegador no soporta getUserMedia', 'bad');
+      alert('Tu navegador no soporta getUserMedia para cámara/micrófono.');
+      return false;
+    }
+
+    if (camStream && video.srcObject) return true;
     try {
       let stream = null;
       try {
@@ -124,13 +136,25 @@
         // Fallback amplio
         stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
       }
-      video.srcObject = stream; await video.play();
+      camStream = stream;
+      video.srcObject = camStream;
+      await video.play();
+      btnCam.disabled = true;
+      btnCamOff.disabled = false;
       setStatus('Cámara activa','good'); return true;
     } catch(e){
       setStatus('Error cámara: '+e.name,'bad');
       alert('No se pudo activar la cámara: '+e.message+'\n\nRevisa permisos del navegador y HTTPS.');
       return false;
     }
+  }
+  function disableCamera() {
+    stopTracks(camStream);
+    camStream = null;
+    video.srcObject = null;
+    btnCam.disabled = false;
+    btnCamOff.disabled = true;
+    setStatus('Cámara apagada', 'info');
   }
 
   function initHands(){
@@ -157,6 +181,14 @@
   }
 
   btnCam.onclick = async () => { await ensureCamera(); };
+  btnCamOff.onclick = () => {
+    if (nvRunning) {
+      nvRunning = false;
+      clearInterval(nvTimer);
+      btnNv.textContent='▶️ Iniciar simulación';
+    }
+    disableCamera();
+  };
 
   btnNv.onclick = async ()=>{
     if (!nvRunning){
